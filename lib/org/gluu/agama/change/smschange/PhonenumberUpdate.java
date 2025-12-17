@@ -64,9 +64,7 @@ public class PhonenumberUpdate extends UserphoneUpdate {
     // Track OTP attempts by IP for 24-hour rate limiting
 
     private static final Map<String, List<Long>> ipAccessLog = new HashMap<>();
-    private static final int MAX_ATTEMPTS_PER_DAY = 4; // 1 + 3 resends allowed
-    private static final long TIME_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
-    private static String currentClientIp = "127.0.0.1"; 
+    private Set<String> whitelistedIps = new HashSet<>();
 
     private static final Map<String, String> otpStore = new HashMap<>();
 
@@ -86,6 +84,66 @@ public class PhonenumberUpdate extends UserphoneUpdate {
 
     private UserService getUserService() {
         return CdiUtil.bean(UserService.class);
+    }
+
+    private boolean isWhitelistedIp(String ip) {
+        try {
+            String list = flowConfig.get("WHITELISTED_IPS");
+            if (list == null || ip == null)
+                return false;
+
+            return Arrays.stream(list.split(","))
+                    .map(String::trim)
+                    .anyMatch(ip::equals);
+
+        } catch (Exception e) {
+            logger.error("Whitelist check failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private void logIncomingHeaders() {
+        try {
+            HttpServletRequest request = CdiUtil.bean(HttpServletRequest.class);
+
+            LogUtils.log("|+++++++++++++++++++++++++++++++++++++| ===== Incoming Headers =====");
+
+            Enumeration<String> headerNames = request.getHeaderNames();
+            if (headerNames == null) {
+                LogUtils.log("|+++++++++++++++++++++++++++++++++++++| No headers found.");
+                return;
+            }
+
+            while (headerNames.hasMoreElements()) {
+                String header = headerNames.nextElement();
+                String value = request.getHeader(header);
+                LogUtils.log("|org.gluu.agama.change.phonenumber| HEADER: {} = {}", header, value);
+            }
+
+            LogUtils.log("|org.gluu.agama.change.phonenumber| ===========================");
+
+        } catch (Exception e) {
+            LogUtils.log("|org.gluu.agama.change.phonenumber| Failed to log headers: {}", e.getMessage());
+        }
+    }
+
+    private String extractClientIp() {
+        try {
+            HttpServletRequest request = CdiUtil.bean(HttpServletRequest.class);
+
+            // 1️⃣ Check X-Forwarded-For first (most reliable)
+            String xff = request.getHeader("X-Forwarded-For");
+            if (xff != null && !xff.isEmpty()) {
+                // Handles multiple IPs: "10.1.1.1, 192.168.1.10"
+                return xff.split(",")[0].trim();
+            }
+
+            // 2️⃣ fallback to remote address
+            return request.getRemoteAddr();
+        } catch (Exception e) {
+            LogUtils.log("Failed to extract client IP: {}", e.getMessage());
+            return "127.0.0.1";
+        }
     }
 
     // validate token starts here
@@ -484,13 +542,15 @@ public class PhonenumberUpdate extends UserphoneUpdate {
 
     public boolean sendOTPCode(String username, String phone) {
 
-        String clientIp = currentClientIp; // ✅ Read stored IP instead of parameter
-        logger.info("Using IP {} for OTP request of user {}", clientIp, username);
+        logIncomingHeaders(); // Log headers for debugging
+
+        String clientIp = extractClientIp(); // ✅ Read stored IP instead of parameter
+        logger.info("Using IP {} for OTP request of user {}", clientIp, phone);
 
         // ✅ Enforce resend rate limit
         if (isIpBlocked(clientIp)) {
             logger.info("IP {} is blocked for 24h due to excessive OTP requests", clientIp);
-            return false;
+            return null;
             }
 
             recordOtpAttempt(clientIp); // ✅ Record attempt with stored IP
@@ -701,23 +761,17 @@ public class PhonenumberUpdate extends UserphoneUpdate {
         return null; // or return "" if you prefer
     }
 
-    // IP RATE LIMITING
-    public static String setClientIp(String clientIp) {
-        if (clientIp == null || clientIp.trim().isEmpty()) {
-            currentClientIp = "127.0.0.1";
-            logger.warn("No Client IP received — defaulting to {}", currentClientIp);
-        } else {
-            currentClientIp = clientIp.trim();
-            logger.info("Client IP set to {}", currentClientIp);
-        }
-        return currentClientIp;
-    }
-
+    // SMS-IP-BLOCKING-FIXES
     private void recordOtpAttempt(String clientIp) {
         long now = System.currentTimeMillis();
+        long timeWindow = Long.parseLong(flowConfig.getOrDefault("TIME_WINDOW_MS", "86400000"));
+
         ipAccessLog.compute(clientIp, (key, timestamps) -> {
-            if (timestamps == null) timestamps = new ArrayList<>();
-            timestamps.removeIf(ts -> now - ts > TIME_WINDOW_MS);
+            if (timestamps == null)
+                timestamps = new ArrayList<>();
+
+            // timestamps.removeIf(ts -> now - ts > TIME_WINDOW_MS);
+            timestamps.removeIf(ts -> now - ts > timeWindow);
             timestamps.add(now);
             return timestamps;
         });
@@ -726,15 +780,24 @@ public class PhonenumberUpdate extends UserphoneUpdate {
     }
 
     private boolean isIpBlocked(String clientIp) {
+        if (isWhitelistedIp(clientIp)) {
+            logger.info("IP {} is WHITELISTED — skipping OTP blocking", clientIp);
+            return false;
+        }
+        int maxAttempts = Integer.parseInt(flowConfig.getOrDefault("MAX_SMS_OTP_PER_DAY", "4"));
+        long timeWindow = Long.parseLong(flowConfig.getOrDefault("TIME_WINDOW_MS", "86400000"));
+
         List<Long> timestamps = ipAccessLog.get(clientIp);
-        if (timestamps == null) return false;
+        if (timestamps == null)
+            return false;
 
         long now = System.currentTimeMillis();
-        timestamps.removeIf(ts -> now - ts > TIME_WINDOW_MS);
+        timestamps.removeIf(ts -> now - ts > timeWindow);
 
-        boolean blocked = timestamps.size() >= MAX_ATTEMPTS_PER_DAY;
+        boolean blocked = timestamps.size() >= maxAttempts;
+
         if (blocked) {
-            logger.warn(" IP {} BLOCKED for 24h — Attempts: {}/{}", clientIp, timestamps.size());
+            logger.warn("IP {} BLOCKED — Attempts: {} / {}", clientIp, timestamps.size(), maxAttempts);
         }
         return blocked;
     }

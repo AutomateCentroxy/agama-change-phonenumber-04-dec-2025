@@ -76,8 +76,8 @@ public class PhonenumberUpdate extends UserphoneUpdate {
     public static synchronized PhonenumberUpdate getInstance(Map<String, String> config) {
         if (INSTANCE == null) {
             INSTANCE = new PhonenumberUpdate();
-            INSTANCE.flowConfig = config;
         }
+        INSTANCE.flowConfig = config;
         // Always update flowConfig to ensure latest config is used
         return INSTANCE;
     }
